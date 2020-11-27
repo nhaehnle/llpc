@@ -211,46 +211,69 @@ bool PatchReadFirstLane::liftReadFirstLane(Function &function) {
 // @param initialReadFirstLanes : The initial amdgcn_readfirstlane vector
 void PatchReadFirstLane::collectAssumeUniforms(BasicBlock *block,
                                                const SmallVectorImpl<Instruction *> &initialReadFirstLanes) {
-  for (auto readfirstlane : initialReadFirstLanes)
-    m_canAssumeUniformDivergentUsesMap.insert({readfirstlane, {}});
+  auto instructionOrder = [](Instruction* lhs, Instruction* rhs) { return lhs->comesBefore(rhs); };
+  SmallVector<Instruction *, 16> candidates;
 
-  for (Instruction &inst : llvm::reverse(*block)) {
-    // Skip readfirstlane-irrelevant instructions or a source of divergence which isn't clear to determine its operands
-    if (m_canAssumeUniformDivergentUsesMap.count(&inst) == 0 || (m_targetTransformInfo->isSourceOfDivergence(&inst)))
-      continue;
+  auto insertCandidate = [&](Instruction *candidate) {
+    auto insertPos = llvm::lower_bound(candidates, candidate, instructionOrder);
+    if (insertPos == candidates.end() || *insertPos != candidate)
+      candidates.insert(insertPos, candidate);
+  };
 
-    // For each operand, see if it can be assumed uniform to be inserted as the key of
-    // m_canAssumeUniformDivergentUsesMap. For all operands, see if they all can be readfirstlane-ified and then collect
-    // them as the value of m_canAssumeUniformDivergentUsesMap Readfirstlane-ified means that the operand is a key of
-    // the map and not fat pointer.
-    bool canCollectOperands = true;
-    auto loadInst = dyn_cast<LoadInst>(&inst);
+  // The given instruction can be assumed to have a uniform result, i.e., replacing its uses by a use of a
+  // readfirstlane of it would be correct. This helper function:
+  //  1. Records this fact and
+  //  2. Determines whether the assumption of a uniform result could be propagated to the candidate's operands.
+  auto tryPropagate = [&](Instruction *candidate) {
+    // Are there reasons inherent to the candidate instruction itself why lifting the readfirstlane even further
+    // isn't possible?
+    bool cannotPropagate =
+        m_targetTransformInfo->isSourceOfDivergence(candidate) ||
+        isa<PHINode>(candidate);
+
     SmallVector<Instruction *, 3> operandInsts;
-    for (Use &use : inst.operands()) {
-      if (!m_divergenceAnalysis->isDivergentUse(&use))
-        continue;
-      auto operandInst = dyn_cast<Instruction>(use.get());
-      if (!operandInst)
-        continue;
-      // Skip the operandInst that is already in the map
-      if (m_canAssumeUniformDivergentUsesMap.count(operandInst) == 1)
-        continue;
-      if (operandInst->getParent() != block || !isAllUsersDefinedInBlock(operandInst, block))
-        continue;
+    if (!cannotPropagate) {
+      for (Use &use : candidate->operands()) {
+        if (!m_divergenceAnalysis->isDivergentUse(&use))
+          continue; // already known to be uniform -- no need to consider this operand
 
-      if (isAllUsersAssumedUniform(operandInst)) {
-        // The operand can be assumed uniform becasue all users are assumed uniform
-        m_canAssumeUniformDivergentUsesMap[operandInst] = {};
-        // NOTE: Stop propagation for a loadInst whose address space is fat pointer because it has uncertain size
-        if (loadInst && loadInst->getPointerAddressSpace() == ADDR_SPACE_BUFFER_FAT_POINTER)
-          canCollectOperands = false;
-      } else {
-        canCollectOperands = false;
+        auto operandInst = dyn_cast<Instruction>(use.get());
+        if (!operandInst) {
+          // Known to be divergent, but not an instruction. Further propagation is currently not implemented.
+          assert(isa<Argument>(operandInst));
+          cannotPropagate = true;
+          break;
+        }
+
+        if (operandInst->getParent() != block || !isAllUsersDefinedInBlock(operandInst, block)) {
+          // Further propagation is currently not implemented. Theoretically, we could insert a readfirstlane
+          // instruction dedicated for users in this basic block, but it's not clear whether that would be a win.
+          cannotPropagate = true;
+          break;
+        }
+
+        operandInsts.push_back(operandInst);
       }
-      operandInsts.push_back(operandInst);
+
+      if (cannotPropagate)
+        operandInsts.clear();
     }
-    if (canCollectOperands)
-      m_canAssumeUniformDivergentUsesMap[&inst] = std::move(operandInsts);
+
+    assert(m_canAssumeUniformDivergentUsesMap.count(candidate) == 0);
+    m_canAssumeUniformDivergentUsesMap.try_emplace(candidate, std::move(operandInsts));
+
+    for (Instruction *operandInst : operandInsts)
+      insertCandidate(operandInst);
+  };
+
+  for (auto readfirstlane : initialReadFirstLanes)
+    tryPropagate(readfirstlane);
+
+  while (!candidates.empty()) {
+    Instruction *candidate = candidates.pop_back_val();
+
+    if (isAllUsersAssumedUniform(candidate))
+      tryPropagate(candidate);
   }
 }
 
@@ -344,7 +367,6 @@ void PatchReadFirstLane::findBestInsertLocation(const SmallVectorImpl<Instructio
             queue.pop_back();
             continue;
           }
-
 
           const auto &candidateOperands = m_canAssumeUniformDivergentUsesMap.find(candidate)->second;
           if (candidateOperands.empty())
