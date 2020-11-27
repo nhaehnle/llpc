@@ -64,12 +64,8 @@ private:
   bool liftReadFirstLane(Function &function);
   void collectAssumeUniforms(BasicBlock *block, const SmallVectorImpl<Instruction *> &initialReadFirstLanes);
   void findBestInsertLocation(const SmallVectorImpl<Instruction *> &initialReadFirstLanes);
-  bool isAllUsesDependCandidate(Instruction *candidateInsertLocatin,
-                                const DenseSet<Instruction *> &nonEarliestDivergentUses,
-                                DenseSet<Instruction *> &visitedInsts);
   bool isAllUsersAssumedUniform(Instruction *inst);
   void applyReadFirstLane(Instruction *inst, BuilderBase &builder);
-  void addLocation(Instruction *inst);
 
   // We only support to apply amdgcn_readfirstlane on float or int type
   // TODO: Support various types when backend work is ready
@@ -290,131 +286,121 @@ void PatchReadFirstLane::findBestInsertLocation(const SmallVectorImpl<Instructio
   // Search chain g->f->d->b->a: nonEarliestDivergentUses {e,c} - stop search up because key %a is related to an empty
   // value. {e,c} required insert location is %a. So we can lift readfirstlane on %a.
 
+  // Set of instructions from m_canAssumeUniformDivergentUsesMap which will be forced to become uniform by the
+  // instructions we already plan to insert so far. Allows us to break out of searches that would be redundant.
+  DenseSet<Instruction *> enforcedUniform;
+  SmallVector<Instruction *, 8> enforcedUniformTracker;
+
   m_insertLocations.clear();
-  // Avoid to process the same instruction mulitple times.
-  DenseSet<Instruction *> visitedInsts;
 
-  // Find a best insert location for each initial readfirstlane.
   for (auto &initialReadFirstLane : initialReadFirstLanes) {
-    // Collect the divergent operands of the `candidateInst` exclude the earliest come operand in basic bloc order.
-    DenseSet<Instruction *> nonEarliestDivergentUses;
-    // Record the best insert location if it is valid.
-    Instruction *insertLocation = nullptr;
-    // Mark whether the search chain involves multiple divergent operands.
-    bool hasMultipleDivergentOperands = false;
-    // The earliest come operands are candidate for best location.
-    // Record the search chain of candidate instructions and start from the initial readfirstlane intrinsic.
-    std::deque<Instruction *> candidateInstDeque;
-    candidateInstDeque.push_back(initialReadFirstLane);
+    // Find a best insert location for a lifted readfirstlane to obsolete the existing, initial readfirstlane.
+    // Conceptually, we trace backwards through the induced data dependency graph (or "cone") of
+    // divergent-but-can-assume-uniform instructions feeding into the initialReadFirstLane.
+    // Each iteration of the middle loop jumps to the next "bottleneck" in this DAG, that is, `current` always points
+    // at a bottleneck where we could insert a single readfirstlane (depending on the type).
+    Instruction *bestInsertLocation = nullptr;
+    unsigned bestInsertLocationDepth = 0;
 
-    // The search isn't stopped until the instruction has no divergent operand.
-    while (!candidateInstDeque.empty()) {
-      auto candidateInst = candidateInstDeque.front();
-      candidateInstDeque.pop_front();
+    Instruction *current = initialReadFirstLane;
 
-      // Skip the processed candidate.
-      if (visitedInsts.count(candidateInst) == 1)
-        continue;
-      visitedInsts.insert(candidateInst);
+    for (;;) {
+      const auto &divergentOperands = m_canAssumeUniformDivergentUsesMap.find(current)->second;
+      if (divergentOperands.empty())
+        break; // no further propagation possible
 
-      // The value of m_canAssumeUniformDivergentUsesMap is empty means we cannot lift readfirstlane over
-      // `candidateInst`. `candidateInst` can be a valid insert location if the search chain doen't involve multiple
-      // operands or all uses directly or indirectly depend on `candidateInst`.
-      auto &divergentOperandsOfCandidate = m_canAssumeUniformDivergentUsesMap[candidateInst];
-      const unsigned divergentOperandCount = divergentOperandsOfCandidate.size();
-      if (divergentOperandCount == 0) {
-        bool isValidInsertLocation = true;
-        if (hasMultipleDivergentOperands)
-          isValidInsertLocation = isAllUsesDependCandidate(candidateInst, nonEarliestDivergentUses, visitedInsts);
-        if (isValidInsertLocation)
-          insertLocation = candidateInst;
-        break;
-      }
+      if (divergentOperands.size() == 1) {
+        // There is only a single operand, we can jump to it directly.
+        current = divergentOperands[0];
+      } else {
+        // There are multiple operands. Since we don't want to increase the number of readfirstlanes, try to find
+        // an earlier bottleneck in the data dependency graph.
+        //
+        // The search proceeds backwards by instruction order in the basic block, maintaining a sorted queue of
+        // instructions that remain to be explored. We use two heuristics to limit the cost of the search:
+        //  - We never explore beyond the earliest operand of `current`.
+        //  - We limit both the depth and the breadth (i.e., maximum queue size) of the search.
+        //
+        // We maintain the queue as a vector because it will always be short, and inserting into a short sorted
+        // vector is very fast.
+        constexpr unsigned MaxSearchBreadth = 4;
+        constexpr unsigned MaxSearchDepth = 10;
+        auto instructionOrder = [](Instruction* lhs, Instruction* rhs) { return lhs->comesBefore(rhs); };
 
-      if (divergentOperandCount > 1)
-        hasMultipleDivergentOperands = true;
+        if (divergentOperands.size() > MaxSearchBreadth)
+          break;
 
-      // `earliestDivergentDef` represents the instruction that comes first in basic block order among all the operands
-      Instruction *earliestDivergentDef = divergentOperandsOfCandidate[0];
-      for (unsigned idx = 1; idx < divergentOperandCount; ++idx) {
-        auto divergentDef = divergentOperandsOfCandidate[idx];
-        if (divergentDef->comesBefore(earliestDivergentDef))
-          earliestDivergentDef = divergentDef;
-      }
-      candidateInstDeque.push_back(earliestDivergentDef);
+        SmallVector<Instruction *, MaxSearchBreadth> queue;
+        queue.insert(queue.begin(), divergentOperands.begin(), divergentOperands.end());
+        llvm::sort(queue, instructionOrder);
 
-      if (hasMultipleDivergentOperands) {
-        // Collect the divergent operands (exclude earliestDivergentDef) of `candidateInst`.
-        for (auto operand : divergentOperandsOfCandidate) {
-          if (operand != earliestDivergentDef)
-            nonEarliestDivergentUses.insert(operand);
-        }
-      }
-    }
-    if (insertLocation)
-      addLocation(insertLocation);
-  }
-}
-
-// =====================================================================================================================
-// Use a queue to track back each non earliest divergent use. Stop search if the use is non-uniform (i.e., not found in
-// m_canAssumeUniformDivergentUsesMap) or it is a key but corresponding an empty vector. Return true if there is no
-// non-uniform and the stopped location is the candidate insert location.
-//
-// @param candidateInsertLocation : The candidate insert location.
-// @param nonEarliestDivergentUses : The set of divergent uses exclude all earliest come operands.
-// @param visitedInsts : The visited instruction set.
-bool PatchReadFirstLane::isAllUsesDependCandidate(Instruction *candidateInsertLocation,
-                                                  const DenseSet<Instruction *> &nonEarliestDivergentUses,
-                                                  DenseSet<Instruction *> &visitedInsts) {
-  DenseSet<Instruction *> extraInsertLocations;
-  // Each instruction on the search chain should be found in the map otherwise the uses cannot depend on one candidate
-  bool hasNonUniform = false;
-  for (auto divergentUse : nonEarliestDivergentUses) {
-    std::deque<Instruction *> searchChain;
-    searchChain.push_back(divergentUse);
-
-    while (!searchChain.empty()) {
-      Instruction *curInst = searchChain.front();
-      searchChain.pop_front();
-
-      if (visitedInsts.count(curInst) == 1)
-        continue;
-      visitedInsts.insert(curInst);
-
-      for (Use &operand : curInst->operands()) {
-        if (auto operandInst = dyn_cast<Instruction>(operand)) {
-          if (m_canAssumeUniformDivergentUsesMap.count(operandInst) == 0) {
-            hasNonUniform = true;
-            break;
+        bool searchAborted = false;
+        unsigned depth = 0;
+        do {
+          Instruction* candidate = queue.back();
+          if (enforcedUniform.count(candidate)) {
+            // Candidate is already enforced to be uniform by a previous decision to insert a readfirstlane.
+            // We can just skip it.
+            queue.pop_back();
+            continue;
           }
-          const auto &divergentOperandsOfCandidate = m_canAssumeUniformDivergentUsesMap[operandInst];
-          for (auto divergentOperand : divergentOperandsOfCandidate) {
-            if (m_canAssumeUniformDivergentUsesMap[divergentOperand].empty()) {
-              // The operand should be an insert location because it has no divergent use
-              extraInsertLocations.insert(divergentOperand);
-            } else {
-              // Continue to search up
-              searchChain.push_back(divergentOperand);
+
+
+          const auto &candidateOperands = m_canAssumeUniformDivergentUsesMap.find(candidate)->second;
+          if (candidateOperands.empty())
+            break; // no further propagation possible, need to abort the search
+          queue.pop_back();
+
+          enforcedUniformTracker.push_back(candidate);
+
+          // Add the operands to the queue if they aren't already contained in it.
+          for (Instruction* operand : candidateOperands) {
+            auto insertPos = llvm::lower_bound(queue, operand, instructionOrder);
+            if (insertPos == queue.end() || *insertPos != operand) {
+              // Abort if the search becomes too "wide" or moves beyond the earliest operand of `current`.
+              if (queue.size() >= MaxSearchBreadth || insertPos == queue.begin()) {
+                searchAborted = true;
+                break;
+              }
+              queue.insert(insertPos, operand);
             }
           }
-        }
-      }
-      if (hasNonUniform)
-        break;
-    }
-    if (hasNonUniform)
-      break;
-  }
 
-  bool isValidInsertLocation = false;
-  if (!hasNonUniform) {
-    const unsigned extraInsertLocationCount = extraInsertLocations.size();
-    if (extraInsertLocationCount == 0 ||
-        (extraInsertLocationCount == 1 && (candidateInsertLocation == *extraInsertLocations.begin())))
-      isValidInsertLocation = true;
+          if (++depth > MaxSearchDepth)
+            break;
+        } while (queue.size() >= 2 && !searchAborted);
+
+        if (queue.size() >= 2)
+          break; // didn't find a next bottleneck in the data dependency graph, bail out
+
+        current = queue[0]; // move to the found bottleneck
+      }
+
+      if (enforcedUniform.count(current)) {
+        // Already enforced to be uniform, no need to continue the search or even consider inserting a new
+        // readfirstlane.
+        bestInsertLocation = nullptr;
+        break;
+      }
+
+      enforcedUniformTracker.push_back(current);
+
+      if (isSupportedType(current)) {
+        bestInsertLocation = current;
+        bestInsertLocationDepth = enforcedUniformTracker.size();
+      }
+    }
+
+    // Record the best (read: earliest) bottleneck that we were able to find in the graph/
+    if (bestInsertLocation) {
+      m_insertLocations.insert(bestInsertLocation);
+
+      for (unsigned idx = 0; idx < bestInsertLocationDepth; ++idx)
+        enforcedUniform.insert(enforcedUniformTracker[idx]);
+    }
+
+    enforcedUniformTracker.clear();
   }
-  return isValidInsertLocation;
 }
 
 // =====================================================================================================================
@@ -459,14 +445,6 @@ void PatchReadFirstLane::applyReadFirstLane(Instruction *inst, BuilderBase &buil
     replaceInst = readFirstLane;
   }
   inst->replaceUsesWithIf(replaceInst, [newInst](Use &U) { return U.getUser() != newInst; });
-}
-
-// =====================================================================================================================
-//
-// @param inst : The instruction to be as a best insert location
-void PatchReadFirstLane::addLocation(Instruction *inst) {
-  if (isSupportedType(inst))
-    m_insertLocations.insert(inst);
 }
 
 // =====================================================================================================================
